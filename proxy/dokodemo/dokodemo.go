@@ -10,7 +10,9 @@ import (
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/task"
 	"v2ray.com/core/proxy"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/internet/udp"
@@ -52,8 +54,12 @@ func (d *DokodemoDoor) policy() core.Policy {
 	return p
 }
 
+type hasHandshakeAddress interface {
+	HandshakeAddress() net.Address
+}
+
 func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher core.Dispatcher) error {
-	newError("processing connection from: ", conn.RemoteAddr()).AtDebug().WithContext(ctx).WriteToLog()
+	newError("processing connection from: ", conn.RemoteAddr()).AtDebug().WriteToLog(session.ExportIDToError(ctx))
 	dest := net.Destination{
 		Network: network,
 		Address: d.address,
@@ -62,27 +68,32 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 	if d.config.FollowRedirect {
 		if origDest, ok := proxy.OriginalTargetFromContext(ctx); ok {
 			dest = origDest
+		} else if handshake, ok := conn.(hasHandshakeAddress); ok {
+			addr := handshake.HandshakeAddress()
+			if addr != nil {
+				dest.Address = addr
+			}
 		}
 	}
 	if !dest.IsValid() || dest.Address == nil {
 		return newError("unable to get destination")
 	}
 
+	plcy := d.policy()
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, d.policy().Timeouts.ConnectionIdle)
+	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
 
+	ctx = core.ContextWithBufferPolicy(ctx, plcy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return newError("failed to dispatch request").Base(err)
 	}
 
 	requestDone := func() error {
-		defer common.Close(link.Writer)
-		defer timer.SetTimeout(d.policy().Timeouts.DownlinkOnly)
+		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
 
-		chunkReader := buf.NewReader(conn)
-
-		if err := buf.Copy(chunkReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
+		reader := buf.NewReader(conn)
+		if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transport request").Base(err)
 		}
 
@@ -90,7 +101,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 	}
 
 	responseDone := func() error {
-		defer timer.SetTimeout(d.policy().Timeouts.UplinkOnly)
+		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
 
 		var writer buf.Writer
 		if network == net.Network_TCP {
@@ -98,14 +109,14 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 		} else {
 			//if we are in TPROXY mode, use linux's udp forging functionality
 			if !d.config.FollowRedirect {
-				writer = buf.NewSequentialWriter(conn)
+				writer = &buf.SequentialWriter{Writer: conn}
 			} else {
 				srca := net.UDPAddr{IP: dest.Address.IP(), Port: int(dest.Port.Value())}
 				origsend, err := udp.TransmitSocket(&srca, conn.RemoteAddr())
 				if err != nil {
 					return err
 				}
-				writer = buf.NewSequentialWriter(origsend)
+				writer = &buf.SequentialWriter{Writer: origsend}
 			}
 		}
 
@@ -116,7 +127,10 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 		return nil
 	}
 
-	if err := signal.ExecuteParallel(ctx, requestDone, responseDone); err != nil {
+	if err := task.Run(task.WithContext(ctx),
+		task.Parallel(
+			task.Single(requestDone, task.OnSuccess(task.Close(link.Writer))),
+			responseDone))(); err != nil {
 		pipe.CloseError(link.Reader)
 		pipe.CloseError(link.Writer)
 		return newError("connection ends").Base(err)

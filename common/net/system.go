@@ -6,6 +6,7 @@ import "net"
 var DialTCP = net.DialTCP
 var DialUDP = net.DialUDP
 var DialUnix = net.DialUnix
+var Dial = net.Dial
 
 var Listen = net.Listen
 var ListenTCP = net.ListenTCP
@@ -51,3 +52,5 @@ type TCPListener = net.TCPListener
 type UnixListener = net.UnixListener
 
 var ResolveUnixAddr = net.ResolveUnixAddr
+
+type Resolver = net.Resolver

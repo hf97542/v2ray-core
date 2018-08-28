@@ -5,6 +5,7 @@ import (
 
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/internet/tls"
 )
@@ -19,7 +20,7 @@ func getTCPSettingsFromContext(ctx context.Context) *Config {
 
 // Dial dials a new TCP connection to the given destination.
 func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error) {
-	newError("dialing TCP to ", dest).WithContext(ctx).WriteToLog()
+	newError("dialing TCP to ", dest).WriteToLog(session.ExportIDToError(ctx))
 	src := internet.DialerSourceFromContext(ctx)
 
 	conn, err := internet.DialSystem(ctx, src, dest)
@@ -47,5 +48,5 @@ func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error
 }
 
 func init() {
-	common.Must(internet.RegisterTransportDialer(internet.TransportProtocol_TCP, Dial))
+	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
 }

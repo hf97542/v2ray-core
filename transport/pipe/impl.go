@@ -8,6 +8,7 @@ import (
 
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/signal/done"
 )
 
 type state byte
@@ -23,6 +24,7 @@ type pipe struct {
 	data        buf.MultiBuffer
 	readSignal  *signal.Notifier
 	writeSignal *signal.Notifier
+	done        *done.Instance
 	limit       int32
 	state       state
 }
@@ -72,12 +74,17 @@ func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return data, err
 		}
 
-		<-p.readSignal.Wait()
+		select {
+		case <-p.readSignal.Wait():
+		case <-p.done.Wait():
+		}
 	}
 }
 
-func (p *pipe) ReadMultiBufferWithTimeout(d time.Duration) (buf.MultiBuffer, error) {
-	timer := time.After(d)
+func (p *pipe) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
 	for {
 		data, err := p.readMultiBufferInternal()
 		if data != nil || err != nil {
@@ -87,7 +94,8 @@ func (p *pipe) ReadMultiBufferWithTimeout(d time.Duration) (buf.MultiBuffer, err
 
 		select {
 		case <-p.readSignal.Wait():
-		case <-timer:
+		case <-p.done.Wait():
+		case <-timer.C:
 			return nil, buf.ErrReadTimeout
 		}
 	}
@@ -117,7 +125,11 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			return err
 		}
 
-		<-p.writeSignal.Wait()
+		select {
+		case <-p.writeSignal.Wait():
+		case <-p.done.Wait():
+			return io.ErrClosedPipe
+		}
 	}
 }
 
@@ -130,8 +142,7 @@ func (p *pipe) Close() error {
 	}
 
 	p.state = closed
-	p.readSignal.Signal()
-	p.writeSignal.Signal()
+	p.done.Close()
 	return nil
 }
 
@@ -150,6 +161,5 @@ func (p *pipe) CloseError() {
 		p.data = nil
 	}
 
-	p.readSignal.Signal()
-	p.writeSignal.Signal()
+	p.done.Close()
 }

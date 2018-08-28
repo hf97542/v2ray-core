@@ -1,4 +1,5 @@
 // +build !windows
+// +build !wasm
 
 package domainsocket
 
@@ -43,5 +44,5 @@ func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error
 }
 
 func init() {
-	common.Must(internet.RegisterTransportDialer(internet.TransportProtocol_DomainSocket, Dial))
+	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
 }
