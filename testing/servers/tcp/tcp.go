@@ -1,12 +1,14 @@
 package tcp
 
 import (
+	"context"
 	"fmt"
 	"io"
 
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/task"
+	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/pipe"
 )
 
@@ -16,26 +18,31 @@ type Server struct {
 	ShouldClose  bool
 	SendFirst    []byte
 	Listen       net.Address
-	listener     *net.TCPListener
+	listener     net.Listener
 }
 
 func (server *Server) Start() (net.Destination, error) {
+	return server.StartContext(context.Background())
+}
+
+func (server *Server) StartContext(ctx context.Context) (net.Destination, error) {
 	listenerAddr := server.Listen
 	if listenerAddr == nil {
 		listenerAddr = net.LocalHostIP
 	}
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{
+	listener, err := internet.ListenSystem(ctx, &net.TCPAddr{
 		IP:   listenerAddr.IP(),
 		Port: int(server.Port),
-		Zone: "",
 	})
 	if err != nil {
 		return net.Destination{}, err
 	}
-	server.Port = net.Port(listener.Addr().(*net.TCPAddr).Port)
-	server.listener = listener
-	go server.acceptConnections(listener)
+
 	localAddr := listener.Addr().(*net.TCPAddr)
+	server.Port = net.Port(localAddr.Port)
+	server.listener = listener
+	go server.acceptConnections(listener.(*net.TCPListener))
+
 	return net.TCPDestination(net.IPAddress(localAddr.IP), net.Port(localAddr.Port)), nil
 }
 
@@ -62,7 +69,7 @@ func (server *Server) handleConnection(conn net.Conn) {
 
 		for {
 			b := buf.New()
-			if err := b.AppendSupplier(buf.ReadFrom(conn)); err != nil {
+			if _, err := b.ReadFrom(conn); err != nil {
 				if err == io.EOF {
 					return nil
 				}

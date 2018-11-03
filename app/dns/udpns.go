@@ -7,12 +7,14 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"v2ray.com/core"
+
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal/pubsub"
 	"v2ray.com/core/common/task"
+	"v2ray.com/core/features/routing"
 	"v2ray.com/core/transport/internet/udp"
 )
 
@@ -46,7 +48,7 @@ type ClassicNameServer struct {
 	clientIP  net.IP
 }
 
-func NewClassicNameServer(address net.Destination, dispatcher core.Dispatcher, clientIP net.IP) *ClassicNameServer {
+func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher, clientIP net.IP) *ClassicNameServer {
 	s := &ClassicNameServer{
 		address:  address,
 		ips:      make(map[string][]IPRecord),
@@ -59,13 +61,18 @@ func NewClassicNameServer(address net.Destination, dispatcher core.Dispatcher, c
 		Execute:  s.Cleanup,
 	}
 	s.udpServer = udp.NewDispatcher(dispatcher, s.HandleResponse)
-	common.Must(s.cleanup.Start())
 	return s
 }
 
 func (s *ClassicNameServer) Cleanup() error {
 	now := time.Now()
 	s.Lock()
+	defer s.Unlock()
+
+	if len(s.ips) == 0 && len(s.requests) == 0 {
+		return newError("nothing to do. stopping...")
+	}
+
 	for domain, ips := range s.ips {
 		newIPs := make([]IPRecord, 0, len(ips))
 		for _, ip := range ips {
@@ -94,7 +101,6 @@ func (s *ClassicNameServer) Cleanup() error {
 		s.requests = make(map[uint16]pendingRequest)
 	}
 
-	s.Unlock()
 	return nil
 }
 
@@ -151,7 +157,6 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, payload *buf.Buf
 
 func (s *ClassicNameServer) updateIP(domain string, ips []IPRecord) {
 	s.Lock()
-	defer s.Unlock()
 
 	newError("updating IP records for domain:", domain).AtDebug().WriteToLog()
 	now := time.Now()
@@ -163,6 +168,9 @@ func (s *ClassicNameServer) updateIP(domain string, ips []IPRecord) {
 	}
 	s.ips[domain] = ips
 	s.pub.Publish(domain, nil)
+
+	s.Unlock()
+	common.Must(s.cleanup.Start())
 }
 
 func (s *ClassicNameServer) getMsgOptions() *dns.OPT {
@@ -252,16 +260,19 @@ func (s *ClassicNameServer) buildMsgs(domain string) []*dns.Msg {
 
 func msgToBuffer(msg *dns.Msg) (*buf.Buffer, error) {
 	buffer := buf.New()
-	if err := buffer.Reset(func(b []byte) (int, error) {
-		writtenBuffer, err := msg.PackBuffer(b)
-		return len(writtenBuffer), err
-	}); err != nil {
+	rawBytes := buffer.Extend(buf.Size)
+	packed, err := msg.PackBuffer(rawBytes)
+	if err != nil {
+		buffer.Release()
 		return nil, err
 	}
+	buffer.Resize(0, int32(len(packed)))
 	return buffer, nil
 }
 
 func (s *ClassicNameServer) sendQuery(ctx context.Context, domain string) {
+	newError("querying DNS for: ", domain).AtDebug().WriteToLog(session.ExportIDToError(ctx))
+
 	msgs := s.buildMsgs(domain)
 
 	for _, msg := range msgs {

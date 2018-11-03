@@ -6,9 +6,8 @@ import (
 
 	"v2ray.com/core/app/dispatcher"
 	"v2ray.com/core/common/net"
-	"v2ray.com/core/common/protocol"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/strmatcher"
-	"v2ray.com/core/proxy"
 )
 
 type Condition interface {
@@ -100,14 +99,8 @@ func NewDomainMatcher(domains []*Domain) (*DomainMatcher, error) {
 		g.Add(m)
 	}
 
-	if len(domains) < 64 {
-		return &DomainMatcher{
-			matchers: g,
-		}, nil
-	}
-
 	return &DomainMatcher{
-		matchers: strmatcher.NewCachedMatcherGroup(g),
+		matchers: g,
 	}, nil
 }
 
@@ -116,104 +109,79 @@ func (m *DomainMatcher) ApplyDomain(domain string) bool {
 }
 
 func (m *DomainMatcher) Apply(ctx context.Context) bool {
-	dest, ok := proxy.TargetFromContext(ctx)
-	if !ok {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil || !outbound.Target.IsValid() {
 		return false
 	}
-
+	dest := outbound.Target
 	if !dest.Address.Family().IsDomain() {
 		return false
 	}
 	return m.ApplyDomain(dest.Address.Domain())
 }
 
-type CIDRMatcher struct {
-	cidr     *net.IPNet
+func sourceFromContext(ctx context.Context) net.Destination {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil {
+		return net.Destination{}
+	}
+	return inbound.Source
+}
+
+func targetFromContent(ctx context.Context) net.Destination {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil {
+		return net.Destination{}
+	}
+	return outbound.Target
+}
+
+type MultiGeoIPMatcher struct {
+	matchers []*GeoIPMatcher
 	onSource bool
 }
 
-func NewCIDRMatcher(ip []byte, mask uint32, onSource bool) (*CIDRMatcher, error) {
-	cidr := &net.IPNet{
-		IP:   net.IP(ip),
-		Mask: net.CIDRMask(int(mask), len(ip)*8),
+func NewMultiGeoIPMatcher(geoips []*GeoIP, onSource bool) (*MultiGeoIPMatcher, error) {
+	var matchers []*GeoIPMatcher
+	for _, geoip := range geoips {
+		matcher, err := globalGeoIPContainer.Add(geoip)
+		if err != nil {
+			return nil, err
+		}
+		matchers = append(matchers, matcher)
 	}
-	return &CIDRMatcher{
-		cidr:     cidr,
+
+	return &MultiGeoIPMatcher{
+		matchers: matchers,
 		onSource: onSource,
 	}, nil
 }
 
-func (v *CIDRMatcher) Apply(ctx context.Context) bool {
+func (m *MultiGeoIPMatcher) Apply(ctx context.Context) bool {
 	ips := make([]net.IP, 0, 4)
-	if resolver, ok := proxy.ResolvedIPsFromContext(ctx); ok {
+	if resolver, ok := ResolvedIPsFromContext(ctx); ok {
 		resolvedIPs := resolver.Resolve()
 		for _, rip := range resolvedIPs {
-			if !rip.Family().IsIPv6() {
-				continue
-			}
 			ips = append(ips, rip.IP())
 		}
 	}
 
 	var dest net.Destination
-	var ok bool
-	if v.onSource {
-		dest, ok = proxy.SourceFromContext(ctx)
+	if m.onSource {
+		dest = sourceFromContext(ctx)
 	} else {
-		dest, ok = proxy.TargetFromContext(ctx)
+		dest = targetFromContent(ctx)
 	}
 
-	if ok && dest.Address.Family().IsIPv6() {
+	if dest.IsValid() && (dest.Address.Family().IsIPv4() || dest.Address.Family().IsIPv6()) {
 		ips = append(ips, dest.Address.IP())
 	}
 
 	for _, ip := range ips {
-		if v.cidr.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-type IPv4Matcher struct {
-	ipv4net  *net.IPNetTable
-	onSource bool
-}
-
-func NewIPv4Matcher(ipnet *net.IPNetTable, onSource bool) *IPv4Matcher {
-	return &IPv4Matcher{
-		ipv4net:  ipnet,
-		onSource: onSource,
-	}
-}
-
-func (v *IPv4Matcher) Apply(ctx context.Context) bool {
-	ips := make([]net.IP, 0, 4)
-	if resolver, ok := proxy.ResolvedIPsFromContext(ctx); ok {
-		resolvedIPs := resolver.Resolve()
-		for _, rip := range resolvedIPs {
-			if !rip.Family().IsIPv4() {
-				continue
+		for _, matcher := range m.matchers {
+			if matcher.Match(ip) {
+				return true
 			}
-			ips = append(ips, rip.IP())
-		}
-	}
-
-	var dest net.Destination
-	var ok bool
-	if v.onSource {
-		dest, ok = proxy.SourceFromContext(ctx)
-	} else {
-		dest, ok = proxy.TargetFromContext(ctx)
-	}
-
-	if ok && dest.Address.Family().IsIPv4() {
-		ips = append(ips, dest.Address.IP())
-	}
-
-	for _, ip := range ips {
-		if v.ipv4net.Contains(ip) {
-			return true
 		}
 	}
 	return false
@@ -230,11 +198,11 @@ func NewPortMatcher(portRange net.PortRange) *PortMatcher {
 }
 
 func (v *PortMatcher) Apply(ctx context.Context) bool {
-	dest, ok := proxy.TargetFromContext(ctx)
-	if !ok {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil || !outbound.Target.IsValid() {
 		return false
 	}
-	return v.port.Contains(dest.Port)
+	return v.port.Contains(outbound.Target.Port)
 }
 
 type NetworkMatcher struct {
@@ -248,11 +216,11 @@ func NewNetworkMatcher(network *net.NetworkList) *NetworkMatcher {
 }
 
 func (v *NetworkMatcher) Apply(ctx context.Context) bool {
-	dest, ok := proxy.TargetFromContext(ctx)
-	if !ok {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil || !outbound.Target.IsValid() {
 		return false
 	}
-	return v.network.HasNetwork(dest.Network)
+	return v.network.HasNetwork(outbound.Target.Network)
 }
 
 type UserMatcher struct {
@@ -272,7 +240,12 @@ func NewUserMatcher(users []string) *UserMatcher {
 }
 
 func (v *UserMatcher) Apply(ctx context.Context) bool {
-	user := protocol.UserFromContext(ctx)
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil {
+		return false
+	}
+
+	user := inbound.User
 	if user == nil {
 		return false
 	}
@@ -301,11 +274,11 @@ func NewInboundTagMatcher(tags []string) *InboundTagMatcher {
 }
 
 func (v *InboundTagMatcher) Apply(ctx context.Context) bool {
-	tag, ok := proxy.InboundTagFromContext(ctx)
-	if !ok {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || len(inbound.Tag) == 0 {
 		return false
 	}
-
+	tag := inbound.Tag
 	for _, t := range v.tags {
 		if t == tag {
 			return true

@@ -5,30 +5,34 @@ import (
 
 	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
-	"v2ray.com/core/app/proxyman/mux"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/dice"
+	"v2ray.com/core/common/mux"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/serial"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/features/stats"
 	"v2ray.com/core/proxy"
+	"v2ray.com/core/transport/internet"
 )
 
-func getStatCounter(v *core.Instance, tag string) (core.StatCounter, core.StatCounter) {
-	var uplinkCounter core.StatCounter
-	var downlinkCounter core.StatCounter
+func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter) {
+	var uplinkCounter stats.Counter
+	var downlinkCounter stats.Counter
 
-	policy := v.PolicyManager()
-	stats := v.Stats()
+	policy := v.GetFeature(policy.ManagerType()).(policy.Manager)
 	if len(tag) > 0 && policy.ForSystem().Stats.InboundUplink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
 		name := "inbound>>>" + tag + ">>>traffic>>>uplink"
-		c, _ := core.GetOrRegisterStatCounter(stats, name)
+		c, _ := stats.GetOrRegisterCounter(statsManager, name)
 		if c != nil {
 			uplinkCounter = c
 		}
 	}
 	if len(tag) > 0 && policy.ForSystem().Stats.InboundDownlink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
 		name := "inbound>>>" + tag + ">>>traffic>>>downlink"
-		c, _ := core.GetOrRegisterStatCounter(stats, name)
+		c, _ := stats.GetOrRegisterCounter(statsManager, name)
 		if c != nil {
 			downlinkCounter = c
 		}
@@ -68,14 +72,31 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	if address == nil {
 		address = net.AnyIP
 	}
+
+	mss, err := internet.ToMemoryStreamConfig(receiverConfig.StreamSettings)
+	if err != nil {
+		return nil, newError("failed to parse stream config").Base(err).AtWarning()
+	}
+
+	if receiverConfig.ReceiveOriginalDestination {
+		if mss.SocketSettings == nil {
+			mss.SocketSettings = &internet.SocketConfig{}
+		}
+		if mss.SocketSettings.Tproxy == internet.SocketConfig_Off {
+			mss.SocketSettings.Tproxy = internet.SocketConfig_Redirect
+		}
+		mss.SocketSettings.ReceiveOriginalDestAddress = true
+	}
+
 	for port := pr.From; port <= pr.To; port++ {
 		if nl.HasNetwork(net.Network_TCP) {
 			newError("creating stream worker on ", address, ":", port).AtDebug().WriteToLog()
+
 			worker := &tcpWorker{
 				address:         address,
 				port:            net.Port(port),
 				proxy:           p,
-				stream:          receiverConfig.StreamSettings,
+				stream:          mss,
 				recvOrigDest:    receiverConfig.ReceiveOriginalDestination,
 				tag:             tag,
 				dispatcher:      h.mux,
@@ -92,10 +113,10 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 				proxy:           p,
 				address:         address,
 				port:            net.Port(port),
-				recvOrigDest:    receiverConfig.ReceiveOriginalDestination,
 				dispatcher:      h.mux,
 				uplinkCounter:   uplinkCounter,
 				downlinkCounter: downlinkCounter,
+				stream:          mss,
 			}
 			h.workers = append(h.workers, worker)
 		}

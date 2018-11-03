@@ -34,8 +34,8 @@ type Listener struct {
 }
 
 func NewListener(ctx context.Context, address net.Address, port net.Port, addConn internet.ConnHandler) (*Listener, error) {
-	networkSettings := internet.TransportSettingsFromContext(ctx)
-	kcpSettings := networkSettings.(*Config)
+	networkSettings := internet.StreamSettingsFromContext(ctx)
+	kcpSettings := networkSettings.ProtocolSettings.(*Config)
 
 	header, err := kcpSettings.GetPackerHeader()
 	if err != nil {
@@ -61,7 +61,7 @@ func NewListener(ctx context.Context, address net.Address, port net.Port, addCon
 		l.tlsConfig = config.GetTLSConfig()
 	}
 
-	hub, err := udp.ListenUDP(address, port, udp.HubCapacity(1024))
+	hub, err := udp.ListenUDP(ctx, address, port, udp.HubCapacity(1024))
 	if err != nil {
 		return nil, err
 	}

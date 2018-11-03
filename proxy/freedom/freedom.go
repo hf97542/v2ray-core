@@ -1,6 +1,6 @@
 package freedom
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg freedom -path Proxy,Freedom
+//go:generate errorgen
 
 import (
 	"context"
@@ -15,30 +15,41 @@ import (
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/proxy"
+	"v2ray.com/core/features/dns"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
 )
 
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		h := new(Handler)
+		if err := core.RequireFeatures(ctx, func(pm policy.Manager, d dns.Client) error {
+			return h.Init(config.(*Config), pm, d)
+		}); err != nil {
+			return nil, err
+		}
+		return h, nil
+	}))
+}
+
 // Handler handles Freedom connections.
 type Handler struct {
-	policyManager core.PolicyManager
-	dns           core.DNSClient
+	policyManager policy.Manager
+	dns           dns.Client
 	config        Config
 }
 
-// New creates a new Freedom handler.
-func New(ctx context.Context, config *Config) (*Handler, error) {
-	v := core.MustFromContext(ctx)
-	f := &Handler{
-		config:        *config,
-		policyManager: v.PolicyManager(),
-		dns:           v.DNSClient(),
-	}
+// Init initializes the Handler with necessary parameters.
+func (h *Handler) Init(config *Config, pm policy.Manager, d dns.Client) error {
+	h.config = *config
+	h.policyManager = pm
+	h.dns = d
 
-	return f, nil
+	return nil
 }
 
-func (h *Handler) policy() core.Policy {
+func (h *Handler) policy() policy.Session {
 	p := h.policyManager.ForLevel(h.config.UserLevel)
 	if h.config.Timeout > 0 && h.config.UserLevel == 0 {
 		p.Timeouts.ConnectionIdle = time.Duration(h.config.Timeout) * time.Second
@@ -47,14 +58,6 @@ func (h *Handler) policy() core.Policy {
 }
 
 func (h *Handler) resolveIP(ctx context.Context, domain string) net.Address {
-	if resolver, ok := proxy.ResolvedIPsFromContext(ctx); ok {
-		ips := resolver.Resolve()
-		if len(ips) == 0 {
-			return nil
-		}
-		return ips[dice.Roll(len(ips))]
-	}
-
 	ips, err := h.dns.LookupIP(domain)
 	if err != nil {
 		newError("failed to get IP address for domain ", domain).Base(err).WriteToLog(session.ExportIDToError(ctx))
@@ -75,8 +78,12 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 }
 
 // Process implements proxy.Outbound.
-func (h *Handler) Process(ctx context.Context, link *core.Link, dialer proxy.Dialer) error {
-	destination, _ := proxy.TargetFromContext(ctx)
+func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil || !outbound.Target.IsValid() {
+		return newError("target not specified.")
+	}
+	destination := outbound.Target
 	if h.config.DestinationOverride != nil {
 		server := h.config.DestinationOverride.Server
 		if isValidAddress(server.Address) {
@@ -153,10 +160,4 @@ func (h *Handler) Process(ctx context.Context, link *core.Link, dialer proxy.Dia
 	}
 
 	return nil
-}
-
-func init() {
-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		return New(ctx, config.(*Config))
-	}))
 }

@@ -1,6 +1,6 @@
 package dispatcher
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg impl -path App,Dispatcher,Default
+//go:generate errorgen
 
 import (
 	"context"
@@ -15,8 +15,11 @@ import (
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/session"
-	"v2ray.com/core/common/stats"
-	"v2ray.com/core/proxy"
+	"v2ray.com/core/features/outbound"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/features/routing"
+	"v2ray.com/core/features/stats"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
 )
 
@@ -36,9 +39,10 @@ func (r *cachedReader) Cache(b *buf.Buffer) {
 	if !mb.IsEmpty() {
 		common.Must(r.cache.WriteMultiBuffer(mb))
 	}
-	common.Must(b.Reset(func(x []byte) (int, error) {
-		return r.cache.Copy(x), nil
-	}))
+	b.Clear()
+	rawBytes := b.Extend(buf.Size)
+	n := r.cache.Copy(rawBytes)
+	b.Resize(0, int32(n))
 	r.Unlock()
 }
 
@@ -80,26 +84,36 @@ func (r *cachedReader) CloseError() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm    core.OutboundHandlerManager
-	router core.Router
-	policy core.PolicyManager
-	stats  core.StatManager
+	ohm    outbound.Manager
+	router routing.Router
+	policy policy.Manager
+	stats  stats.Manager
 }
 
-// NewDefaultDispatcher create a new DefaultDispatcher.
-func NewDefaultDispatcher(ctx context.Context, config *Config) (*DefaultDispatcher, error) {
-	v := core.MustFromContext(ctx)
-	d := &DefaultDispatcher{
-		ohm:    v.OutboundHandlerManager(),
-		router: v.Router(),
-		policy: v.PolicyManager(),
-		stats:  v.Stats(),
-	}
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		d := new(DefaultDispatcher)
+		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager) error {
+			return d.Init(config.(*Config), om, router, pm, sm)
+		}); err != nil {
+			return nil, err
+		}
+		return d, nil
+	}))
+}
 
-	if err := v.RegisterFeature((*core.Dispatcher)(nil), d); err != nil {
-		return nil, newError("unable to register Dispatcher").Base(err)
-	}
-	return d, nil
+// Init initializes DefaultDispatcher.
+func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager) error {
+	d.ohm = om
+	d.router = router
+	d.policy = pm
+	d.stats = sm
+	return nil
+}
+
+// Type implements common.HasType.
+func (*DefaultDispatcher) Type() interface{} {
+	return routing.DispatcherType()
 }
 
 // Start implements common.Runnable.
@@ -110,28 +124,33 @@ func (*DefaultDispatcher) Start() error {
 // Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
 
-func (d *DefaultDispatcher) getLink(ctx context.Context) (*core.Link, *core.Link) {
+func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
 	opt := pipe.OptionsFromContext(ctx)
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
-	inboundLink := &core.Link{
+	inboundLink := &transport.Link{
 		Reader: downlinkReader,
 		Writer: uplinkWriter,
 	}
 
-	outboundLink := &core.Link{
+	outboundLink := &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	}
 
-	user := protocol.UserFromContext(ctx)
+	sessionInbound := session.InboundFromContext(ctx)
+	var user *protocol.MemoryUser
+	if sessionInbound != nil {
+		user = sessionInbound.User
+	}
+
 	if user != nil && len(user.Email) > 0 {
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := core.GetOrRegisterStatCounter(d.stats, name); c != nil {
-				inboundLink.Writer = &stats.SizeStatWriter{
+			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+				inboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  inboundLink.Writer,
 				}
@@ -139,8 +158,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*core.Link, *core.Link
 		}
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := core.GetOrRegisterStatCounter(d.stats, name); c != nil {
-				outboundLink.Writer = &stats.SizeStatWriter{
+			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+				outboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  outboundLink.Writer,
 				}
@@ -160,12 +179,15 @@ func shouldOverride(result SniffResult, domainOverride []string) bool {
 	return false
 }
 
-// Dispatch implements core.Dispatcher.
-func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*core.Link, error) {
+// Dispatch implements routing.Dispatcher.
+func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
-	ctx = proxy.ContextWithTarget(ctx, destination)
+	ob := &session.Outbound{
+		Target: destination,
+	}
+	ctx = session.ContextWithOutbound(ctx, ob)
 
 	inbound, outbound := d.getLink(ctx)
 	sniffingConfig := proxyman.SniffingConfigFromContext(ctx)
@@ -185,7 +207,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				domain := result.Domain()
 				newError("sniffed domain: ", domain).WriteToLog(session.ExportIDToError(ctx))
 				destination.Address = net.ParseAddress(domain)
-				ctx = proxy.ContextWithTarget(ctx, destination)
+				ob.Target = destination
 			}
 			d.routedDispatch(ctx, outbound, destination)
 		}()
@@ -205,26 +227,25 @@ func sniffer(ctx context.Context, cReader *cachedReader) (SniffResult, error) {
 			return nil, ctx.Err()
 		default:
 			totalAttempt++
-			if totalAttempt > 5 {
+			if totalAttempt > 2 {
 				return nil, errSniffingTimeout
 			}
 
 			cReader.Cache(payload)
 			if !payload.IsEmpty() {
 				result, err := sniffer.Sniff(payload.Bytes())
-				if err != core.ErrNoClue {
+				if err != common.ErrNoClue {
 					return result, err
 				}
 			}
 			if payload.IsFull() {
 				return nil, errUnknownContent
 			}
-			time.Sleep(time.Millisecond * 100)
 		}
 	}
 }
 
-func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *core.Link, destination net.Destination) {
+func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
 	dispatcher := d.ohm.GetDefaultHandler()
 	if d.router != nil {
 		if tag, err := d.router.PickRoute(ctx); err == nil {
@@ -239,10 +260,4 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *core.Link,
 		}
 	}
 	dispatcher.Dispatch(ctx, link)
-}
-
-func init() {
-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		return NewDefaultDispatcher(ctx, config.(*Config))
-	}))
 }

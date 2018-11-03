@@ -1,6 +1,6 @@
 package dokodemo
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg dokodemo -path Proxy,Dokodemo
+//go:generate errorgen
 
 import (
 	"context"
@@ -13,39 +13,47 @@ import (
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/proxy"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/features/routing"
 	"v2ray.com/core/transport/internet"
-	"v2ray.com/core/transport/internet/udp"
 	"v2ray.com/core/transport/pipe"
 )
 
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		d := new(DokodemoDoor)
+		err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
+			return d.Init(config.(*Config), pm)
+		})
+		return d, err
+	}))
+}
+
 type DokodemoDoor struct {
-	policyManager core.PolicyManager
+	policyManager policy.Manager
 	config        *Config
 	address       net.Address
 	port          net.Port
 }
 
-func New(ctx context.Context, config *Config) (*DokodemoDoor, error) {
+// Init initializes the DokodemoDoor instance with necessary parameters.
+func (d *DokodemoDoor) Init(config *Config, pm policy.Manager) error {
 	if config.NetworkList == nil || config.NetworkList.Size() == 0 {
-		return nil, newError("no network specified")
+		return newError("no network specified")
 	}
-	v := core.MustFromContext(ctx)
-	d := &DokodemoDoor{
-		config:        config,
-		address:       config.GetPredefinedAddress(),
-		port:          net.Port(config.Port),
-		policyManager: v.PolicyManager(),
-	}
+	d.config = config
+	d.address = config.GetPredefinedAddress()
+	d.port = net.Port(config.Port)
+	d.policyManager = pm
 
-	return d, nil
+	return nil
 }
 
 func (d *DokodemoDoor) Network() net.NetworkList {
 	return *(d.config.NetworkList)
 }
 
-func (d *DokodemoDoor) policy() core.Policy {
+func (d *DokodemoDoor) policy() policy.Session {
 	config := d.config
 	p := d.policyManager.ForLevel(config.UserLevel)
 	if config.Timeout > 0 && config.UserLevel == 0 {
@@ -58,7 +66,7 @@ type hasHandshakeAddress interface {
 	HandshakeAddress() net.Address
 }
 
-func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher core.Dispatcher) error {
+func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher routing.Dispatcher) error {
 	newError("processing connection from: ", conn.RemoteAddr()).AtDebug().WriteToLog(session.ExportIDToError(ctx))
 	dest := net.Destination{
 		Network: network,
@@ -66,8 +74,8 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 		Port:    d.port,
 	}
 	if d.config.FollowRedirect {
-		if origDest, ok := proxy.OriginalTargetFromContext(ctx); ok {
-			dest = origDest
+		if outbound := session.OutboundFromContext(ctx); outbound != nil && outbound.Target.IsValid() {
+			dest = outbound.Target
 		} else if handshake, ok := conn.(hasHandshakeAddress); ok {
 			addr := handshake.HandshakeAddress()
 			if addr != nil {
@@ -83,7 +91,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
 
-	ctx = core.ContextWithBufferPolicy(ctx, plcy.Buffer)
+	ctx = policy.ContextWithBufferPolicy(ctx, plcy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return newError("failed to dispatch request").Base(err)
@@ -111,12 +119,18 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 			if !d.config.FollowRedirect {
 				writer = &buf.SequentialWriter{Writer: conn}
 			} else {
-				srca := net.UDPAddr{IP: dest.Address.IP(), Port: int(dest.Port.Value())}
-				origsend, err := udp.TransmitSocket(&srca, conn.RemoteAddr())
+				tCtx := internet.ContextWithBindAddress(context.Background(), dest)
+				tCtx = internet.ContextWithStreamSettings(tCtx, &internet.MemoryStreamConfig{
+					ProtocolName: "udp",
+					SocketSettings: &internet.SocketConfig{
+						Tproxy: internet.SocketConfig_TProxy,
+					},
+				})
+				tConn, err := internet.DialSystem(tCtx, net.DestinationFromAddr(conn.RemoteAddr()))
 				if err != nil {
 					return err
 				}
-				writer = &buf.SequentialWriter{Writer: origsend}
+				writer = &buf.SequentialWriter{Writer: tConn}
 			}
 		}
 
@@ -137,10 +151,4 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 	}
 
 	return nil
-}
-
-func init() {
-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		return New(ctx, config.(*Config))
-	}))
 }

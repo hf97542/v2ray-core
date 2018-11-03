@@ -1,6 +1,6 @@
 package dns
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg dns -path App,DNS
+//go:generate errorgen
 
 import (
 	"context"
@@ -11,6 +11,9 @@ import (
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/strmatcher"
+	"v2ray.com/core/features"
+	"v2ray.com/core/features/dns"
+	"v2ray.com/core/features/routing"
 )
 
 type Server struct {
@@ -39,11 +42,6 @@ func New(ctx context.Context, config *Config) (*Server, error) {
 	}
 	server.hosts = hosts
 
-	v := core.MustFromContext(ctx)
-	if err := v.RegisterFeature((*core.DNSClient)(nil), server); err != nil {
-		return nil, newError("unable to register DNSClient.").Base(err)
-	}
-
 	addNameServer := func(endpoint *net.Endpoint) int {
 		address := endpoint.Address.AsAddress()
 		if address.Family().IsDomain() && address.Domain() == "localhost" {
@@ -54,10 +52,19 @@ func New(ctx context.Context, config *Config) (*Server, error) {
 				dest.Network = net.Network_UDP
 			}
 			if dest.Network == net.Network_UDP {
-				server.servers = append(server.servers, NewClassicNameServer(dest, v.Dispatcher(), server.clientIP))
+				idx := len(server.servers)
+				server.servers = append(server.servers, nil)
+
+				core.RequireFeatures(ctx, func(d routing.Dispatcher) {
+					server.servers[idx] = NewClassicNameServer(dest, d, server.clientIP)
+				})
 			}
 		}
 		return len(server.servers) - 1
+	}
+
+	if len(config.NameServers) > 0 {
+		features.PrintDeprecatedFeatureWarning("simple DNS server")
 	}
 
 	for _, destPB := range config.NameServers {
@@ -74,19 +81,14 @@ func New(ctx context.Context, config *Config) (*Server, error) {
 			for _, domain := range ns.PrioritizedDomain {
 				matcher, err := toStrMatcher(domain.Type, domain.Domain)
 				if err != nil {
-					return nil, newError("failed to create proritized domain").Base(err).AtWarning()
+					return nil, newError("failed to create prioritized domain").Base(err).AtWarning()
 				}
 				midx := domainMatcher.Add(matcher)
 				domainIndexMap[midx] = uint32(idx)
 			}
 		}
 
-		if domainMatcher.Size() > 64 {
-			server.domainMatcher = strmatcher.NewCachedMatcherGroup(domainMatcher)
-		} else {
-			server.domainMatcher = domainMatcher
-		}
-
+		server.domainMatcher = domainMatcher
 		server.domainIndexMap = domainIndexMap
 	}
 
@@ -95,6 +97,11 @@ func New(ctx context.Context, config *Config) (*Server, error) {
 	}
 
 	return server, nil
+}
+
+// Type implements common.HasType.
+func (*Server) Type() interface{} {
+	return dns.ClientType()
 }
 
 // Start implements common.Runnable.
@@ -114,6 +121,7 @@ func (s *Server) queryIPTimeout(server NameServerInterface, domain string) ([]ne
 	return ips, err
 }
 
+// LookupIP implements dns.Client.
 func (s *Server) LookupIP(domain string) ([]net.IP, error) {
 	if ip := s.hosts.LookupIP(domain); len(ip) > 0 {
 		return ip, nil
@@ -123,7 +131,7 @@ func (s *Server) LookupIP(domain string) ([]net.IP, error) {
 	if s.domainMatcher != nil {
 		idx := s.domainMatcher.Match(domain)
 		if idx > 0 {
-			ns := s.servers[idx]
+			ns := s.servers[s.domainIndexMap[idx]]
 			ips, err := s.queryIPTimeout(ns, domain)
 			if len(ips) > 0 {
 				return ips, nil

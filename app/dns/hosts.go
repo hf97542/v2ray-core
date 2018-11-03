@@ -4,6 +4,7 @@ import (
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/strmatcher"
+	"v2ray.com/core/features"
 )
 
 type StaticHosts struct {
@@ -15,6 +16,7 @@ var typeMap = map[DomainMatchingType]strmatcher.Type{
 	DomainMatchingType_Full:      strmatcher.Full,
 	DomainMatchingType_Subdomain: strmatcher.Domain,
 	DomainMatchingType_Keyword:   strmatcher.Substr,
+	DomainMatchingType_Regex:     strmatcher.Regex,
 }
 
 func toStrMatcher(t DomainMatchingType, domain string) (strmatcher.Matcher, error) {
@@ -37,6 +39,8 @@ func NewStaticHosts(hosts []*Config_HostMapping, legacy map[string]*net.IPOrDoma
 	}
 
 	if legacy != nil {
+		features.PrintDeprecatedFeatureWarning("simple host mapping")
+
 		for domain, ip := range legacy {
 			matcher, err := strmatcher.Full.New(domain)
 			common.Must(err)
