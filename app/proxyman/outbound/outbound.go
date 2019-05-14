@@ -4,11 +4,13 @@ package outbound
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
 	"v2ray.com/core/common"
+	"v2ray.com/core/common/errors"
 	"v2ray.com/core/features/outbound"
 )
 
@@ -63,15 +65,16 @@ func (m *Manager) Close() error {
 
 	m.running = false
 
+	var errs []error
 	for _, h := range m.taggedHandler {
-		h.Close()
+		errs = append(errs, h.Close())
 	}
 
 	for _, h := range m.untaggedHandlers {
-		h.Close()
+		errs = append(errs, h.Close())
 	}
 
-	return nil
+	return errors.Combine(errs...)
 }
 
 // GetDefaultHandler implements outbound.Manager.
@@ -132,6 +135,29 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 	}
 
 	return nil
+}
+
+// Select implements outbound.HandlerSelector.
+func (m *Manager) Select(selectors []string) []string {
+	m.access.RLock()
+	defer m.access.RUnlock()
+
+	tags := make([]string, 0, len(selectors))
+
+	for tag := range m.taggedHandler {
+		match := false
+		for _, selector := range selectors {
+			if strings.HasPrefix(tag, selector) {
+				match = true
+				break
+			}
+		}
+		if match {
+			tags = append(tags, tag)
+		}
+	}
+
+	return tags
 }
 
 func init() {

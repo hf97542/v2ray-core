@@ -25,7 +25,7 @@ type ClientManager struct {
 }
 
 func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
-	for {
+	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
 			return err
@@ -34,6 +34,8 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 			return nil
 		}
 	}
+
+	return newError("unable to find an available mux client").AtWarning()
 }
 
 type WorkerPicker interface {
@@ -211,8 +213,8 @@ func (m *ClientWorker) monitor() {
 		select {
 		case <-m.done.Wait():
 			m.sessionManager.Close()
-			common.Close(m.link.Writer)    // nolint: errcheck
-			pipe.CloseError(m.link.Reader) // nolint: errcheck
+			common.Close(m.link.Writer)     // nolint: errcheck
+			common.Interrupt(m.link.Reader) // nolint: errcheck
 			return
 		case <-timer.C:
 			size := m.sessionManager.Size()
@@ -251,14 +253,14 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	if err := writeFirstPayload(s.input, writer); err != nil {
 		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.hasError = true
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		return
 	}
 
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.hasError = true
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		return
 	}
 }
@@ -272,7 +274,7 @@ func (m *ClientWorker) IsClosing() bool {
 }
 
 func (m *ClientWorker) IsFull() bool {
-	if m.IsClosing() {
+	if m.IsClosing() || m.Closed() {
 		return true
 	}
 
@@ -320,6 +322,10 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
+		// Notify remote peer to close this session.
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
+		closingWriter.Close()
+
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -328,8 +334,12 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
 
+		// Notify remote peer to close this session.
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
+		closingWriter.Close()
+
 		drainErr := buf.Copy(rr, buf.Discard)
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
 	}
@@ -340,8 +350,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
 		if meta.Option.Has(OptionError) {
-			pipe.CloseError(s.input)
-			pipe.CloseError(s.output)
+			common.Interrupt(s.input)
+			common.Interrupt(s.output)
 		}
 		s.Close()
 	}

@@ -10,8 +10,43 @@ import (
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/platform"
-	"v2ray.com/ext/sysio"
+	"v2ray.com/core/common/platform/filesystem"
 )
+
+func init() {
+	wd, err := os.Getwd()
+	common.Must(err)
+
+	common.Must(filesystem.CopyFile(platform.GetAssetLocation("geoip.dat"), filepath.Join(wd, "..", "..", "release", "config", "geoip.dat")))
+	common.Must(filesystem.CopyFile(platform.GetAssetLocation("geosite.dat"), filepath.Join(wd, "..", "..", "release", "config", "geosite.dat")))
+}
+
+func TestGeoIPMatcherContainer(t *testing.T) {
+	container := &router.GeoIPMatcherContainer{}
+
+	m1, err := container.Add(&router.GeoIP{
+		CountryCode: "CN",
+	})
+	common.Must(err)
+
+	m2, err := container.Add(&router.GeoIP{
+		CountryCode: "US",
+	})
+	common.Must(err)
+
+	m3, err := container.Add(&router.GeoIP{
+		CountryCode: "CN",
+	})
+	common.Must(err)
+
+	if m1 != m3 {
+		t.Error("expect same matcher for same geoip, but not")
+	}
+
+	if m1 == m2 {
+		t.Error("expect different matcher for different geoip, but actually same")
+	}
+}
 
 func TestGeoIPMatcher(t *testing.T) {
 	cidrList := router.CIDRList{
@@ -85,8 +120,6 @@ func TestGeoIPMatcher(t *testing.T) {
 }
 
 func TestGeoIPMatcher4CN(t *testing.T) {
-	common.Must(sysio.CopyFile(platform.GetAssetLocation("geoip.dat"), filepath.Join(os.Getenv("GOPATH"), "src", "v2ray.com", "core", "release", "config", "geoip.dat")))
-
 	ips, err := loadGeoIP("CN")
 	common.Must(err)
 
@@ -99,8 +132,6 @@ func TestGeoIPMatcher4CN(t *testing.T) {
 }
 
 func TestGeoIPMatcher6US(t *testing.T) {
-	common.Must(sysio.CopyFile(platform.GetAssetLocation("geoip.dat"), filepath.Join(os.Getenv("GOPATH"), "src", "v2ray.com", "core", "release", "config", "geoip.dat")))
-
 	ips, err := loadGeoIP("US")
 	common.Must(err)
 
@@ -113,7 +144,7 @@ func TestGeoIPMatcher6US(t *testing.T) {
 }
 
 func loadGeoIP(country string) ([]*router.CIDR, error) {
-	geoipBytes, err := sysio.ReadAsset("geoip.dat")
+	geoipBytes, err := filesystem.ReadAsset("geoip.dat")
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +163,6 @@ func loadGeoIP(country string) ([]*router.CIDR, error) {
 }
 
 func BenchmarkGeoIPMatcher4CN(b *testing.B) {
-	common.Must(sysio.CopyFile(platform.GetAssetLocation("geoip.dat"), filepath.Join(os.Getenv("GOPATH"), "src", "v2ray.com", "core", "release", "config", "geoip.dat")))
-
 	ips, err := loadGeoIP("CN")
 	common.Must(err)
 
@@ -148,8 +177,6 @@ func BenchmarkGeoIPMatcher4CN(b *testing.B) {
 }
 
 func BenchmarkGeoIPMatcher6US(b *testing.B) {
-	common.Must(sysio.CopyFile(platform.GetAssetLocation("geoip.dat"), filepath.Join(os.Getenv("GOPATH"), "src", "v2ray.com", "core", "release", "config", "geoip.dat")))
-
 	ips, err := loadGeoIP("US")
 	common.Must(err)
 
